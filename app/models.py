@@ -724,3 +724,46 @@ class RetentionResponse(BaseModel):
         ),
     )
     by_status: RetentionStatusBreakdownOut
+
+
+# ---------------------------------------------------------------------------
+# read-only per-source gap detection
+# ---------------------------------------------------------------------------
+
+class SourceGapOut(BaseModel):
+    source_id: str
+    start_key: TimelineKeyOut = Field(
+        ...,
+        description="Earlier published reading of the adjacent pair (inclusive window endpoint)",
+    )
+    end_key: TimelineKeyOut = Field(
+        ...,
+        description="Later published reading of the adjacent pair (inclusive window endpoint)",
+    )
+    gap_seconds: float = Field(
+        ...,
+        description=(
+            "Event-time distance end_key.observed_at - start_key.observed_at"
+            " in seconds; always strictly greater than max_gap_seconds"
+        ),
+    )
+
+
+class SourceGapsResponse(BaseModel):
+    session_id: str
+    source_id: Optional[str] = None
+    from_: Optional[str] = Field(
+        None,
+        validation_alias="from",
+        serialization_alias="from",
+    )
+    to: Optional[str] = None
+    max_gap_seconds: float
+    limit: int
+    matched: int = Field(
+        ..., description="Gaps matching the filters and threshold (pre-cursor/limit)"
+    )
+    next_cursor: Optional[str] = Field(
+        None, description="Opaque keyset cursor; pass it back verbatim to fetch the next page"
+    )
+    gaps: list[SourceGapOut]
