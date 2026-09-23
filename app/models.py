@@ -157,6 +157,47 @@ class QuarantineAuditResponse(BaseModel):
     readings: list[QuarantineAuditOut]
 
 
+# ---------------------------------------------------------------------------
+# read-only per-source gap scan
+# ---------------------------------------------------------------------------
+
+class SourceGapOut(BaseModel):
+    source_id: str
+    start_key: TimelineKeyOut = Field(
+        ..., description="Published reading at the start of the gap"
+    )
+    end_key: TimelineKeyOut = Field(
+        ..., description="Next published reading of the same source"
+    )
+    gap_seconds: float = Field(
+        ...,
+        description=(
+            "Event-time distance between the two adjacent published readings"
+            " (strictly greater than max_gap_seconds)"
+        ),
+    )
+
+
+class SourceGapsResponse(BaseModel):
+    session_id: str
+    source_id: Optional[str] = None
+    from_: Optional[str] = Field(
+        None,
+        validation_alias="from",
+        serialization_alias="from",
+    )
+    to: Optional[str] = None
+    max_gap_seconds: float
+    limit: int
+    matched: int = Field(
+        ..., description="Gaps matching the filters (pre-pagination)"
+    )
+    returned: int = Field(..., description="Gaps in this page")
+    has_more: bool = Field(..., description="True when more matched gaps remain beyond the page")
+    next_cursor: Optional[str] = None
+    gaps: list[SourceGapOut]
+
+
 class SealSourceIn(BaseModel):
     final_observed_at: str = Field(
         ...,

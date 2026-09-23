@@ -16,6 +16,7 @@ from . import (
     release_plan,
     retention,
     service,
+    source_gaps,
 )
 from .config import settings
 from .database import get_db, init_db
@@ -46,6 +47,7 @@ from .models import (
     RetentionResponse,
     SealSourceIn,
     SessionOut,
+    SourceGapsResponse,
 )
 from .time_utils import TimestampError
 
@@ -76,7 +78,10 @@ app = FastAPI(
         "N buffered readings. A read-only quarantine-audit endpoint previews, "
         "in one snapshot, where each quarantined reading would land if it "
         "were inserted into the published timeline by event time, which "
-        "published neighbours and checkpoint it would affect."
+        "published neighbours and checkpoint it would affect. A read-only "
+        "source-gaps endpoint scans, in one snapshot, the published "
+        "readings of each source and reports adjacent pairs whose "
+        "event-time distance strictly exceeds a caller-given threshold."
     ),
     lifespan=lifespan,
 )
@@ -277,6 +282,70 @@ async def quarantine_impact_audit(
         limit=body.get("limit"),
     )
     return QuarantineAuditResponse(**result)
+
+
+@app.get(
+    "/sessions/{session_id}/source-gaps",
+    response_model=SourceGapsResponse,
+    tags=["readings"],
+)
+def get_source_gaps(
+    session_id: str,
+    max_gap_seconds: Optional[str] = Query(
+        None,
+        description=(
+            "Required. Positive finite number of seconds: two consecutively"
+            " published readings of a source further apart than this (in"
+            " event time) form a gap"
+        ),
+    ),
+    source_id: Optional[str] = Query(
+        None, description="Restrict the scan to one declared source of the session"
+    ),
+    from_: Optional[str] = Query(
+        None,
+        alias="from",
+        description="Inclusive event-time lower bound for participating readings",
+    ),
+    to: Optional[str] = Query(
+        None, description="Inclusive event-time upper bound for participating readings"
+    ),
+    limit: Optional[str] = Query(None, description="Page size 1-1000 (default 100)"),
+    cursor: Optional[str] = Query(
+        None, description="Opaque next_cursor from a previous page"
+    ),
+    conn: sqlite3.Connection = Depends(get_db),
+) -> SourceGapsResponse:
+    """Per-source event-time gaps in the published timeline (read-only).
+
+    Inside one SQLite read snapshot, the published readings of each declared
+    source (or only ``source_id``) are scanned in the deterministic
+    per-source order ``(observed_at, seq)``; every adjacent pair whose
+    event-time distance is **strictly greater** than ``max_gap_seconds`` is
+    reported with its source, the start/end reading keys and the gap in
+    seconds.  ``from``/``to`` are inclusive bounds restricting which
+    published readings participate.  Results are ordered by
+    ``(source_id, start key)`` and paginated with an opaque keyset cursor,
+    so filtering and paging stay deterministic across pages.  The call never
+    writes: watermarks, alerts and checkpoints are unaffected.  A missing or
+    invalid ``max_gap_seconds``/``limit``/interval/cursor and an undeclared
+    ``source_id`` return 400; an unknown session returns 404.
+    """
+    # All parameters arrive as raw query strings and are validated inside the
+    # module so every semantic error is 400 (not FastAPI's 422), matching the
+    # quarantine-audit endpoint.
+    return SourceGapsResponse(
+        **source_gaps.list_source_gaps(
+            conn,
+            session_id,
+            max_gap_seconds=max_gap_seconds,
+            source_id=source_id,
+            from_=from_,
+            to=to,
+            limit=limit,
+            cursor=cursor,
+        )
+    )
 
 
 @app.get(

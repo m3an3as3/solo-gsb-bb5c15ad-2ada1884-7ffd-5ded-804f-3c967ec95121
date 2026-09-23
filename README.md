@@ -38,6 +38,13 @@ buffered 读数按既定全局顺序一次性发布（**尾流发布**）、推�
 **键与事件时间差**，以及最早会受影响的**检查点名称**；不写任何数据，支持按 `source_id`、
 事件时间闭区间 `from`/`to` 与 `limit` 稳定过滤。
 
+最后，**来源缺口扫描**接口 `GET /sessions/{session_id}/source-gaps` 在**同一个 SQLite
+读快照**内按来源扫描已发布读数：对每个来源（或指定的某一个），按确定顺序
+`(observed_at, seq)` 找出相邻两条已发布读数事件时间差**严格大于** `max_gap_seconds`
+的缺口，返回来源、缺口起止读数键与间隔秒数；支持 `source_id`、事件时间闭区间
+`from`/`to` 过滤与不透明游标分页，过滤与跨页翻页均保持确定顺序；接口完全只读，
+不写库、不影响水位线、告警与检查点。
+
 - 语言/框架：Python 3.11 · FastAPI · Uvicorn
 - 存储：SQLite（WAL 模式，单文件，零外部依赖）
 - 并发：写操作在 `BEGIN IMMEDIATE` 事务内串行化，水位线推进单调、发布只发生一次，
@@ -75,7 +82,7 @@ docker compose up --build
 ```bash
 python3 -m pip install -r requirements.txt
 SENSOR_DB_PATH=./sensors.db uvicorn app.main:app --reload --port 8000
-pytest -q        # 运行 239 个端到端行为测试（需 pytest、httpx）
+pytest -q        # 运行 281 个端到端行为测试（需 pytest、httpx）
 ```
 
 ## 时间线语义
@@ -689,6 +696,61 @@ curl -s -X POST localhost:8000/sessions/lab-1/quarantine-audit \
 - 错误码：会话不存在 → 404；非法 JSON / 请求体不是对象、非法 `from`/`to`、`from` 晚于
   `to`、非法 `limit`、空白或非字符串 `source_id`、未声明来源 → 400。
 
+### 21. 来源缺口扫描（只读）
+
+`GET /sessions/{session_id}/source-gaps?max_gap_seconds=60&source_id=...&from=...&to=...&limit=100&cursor=...`
+
+在**同一个 SQLite 读快照**内按来源扫描**已发布**读数（`buffered` 与 `quarantined`
+永不参与），找出相邻读数的事件时间缺口。**完全只读**：绝不写库，水位线、告警状态与
+检查点不受任何影响，重复调用幂等。查询参数：
+
+| 参数 | 说明 |
+| --- | --- |
+| `max_gap_seconds` | **必填**，正的有限数值（秒）；相邻两条同来源已发布读数的事件时间差**严格大于**它才构成缺口（恰好相等不算，比较按微秒精度精确进行） |
+| `source_id` | 可选；只扫描该来源，须为会话已声明来源，否则 400 |
+| `from` / `to` | 可选事件时间闭区间（**含等号**，ISO 8601，统一按 UTC 归一化）：只有 `from <= observed_at <= to` 的已发布读数参与扫描，相邻关系在过滤后的读数上重新计算；`from` 晚于 `to` → 400 |
+| `limit` | 单页条数，整数 1～1000，默认 100；越界/非整数 → 400 |
+| `cursor` | 上一页响应的 `next_cursor`，原样回传翻页；损坏游标 → 400 |
+
+每个来源独立按确定顺序 `(observed_at, seq)` 扫描（`seq` 在来源内唯一，顺序是全序）；
+每个缺口返回 `source_id`、缺口**起始读数键** `start_key` 与**结束读数键** `end_key`
+（均为 `observed_at`/`source_id`/`seq`）以及 `gap_seconds`（间隔秒数）。结果按
+`(source_id, 起始读数键)` 排序——每个来源内一条读数至多作为一个缺口的起点，该顺序是
+全序，因此**过滤与跨页翻页都保持确定顺序**：`next_cursor` 为 `null` 表示取完，
+`matched` 为过滤后、分页前的缺口总数（不随游标变化），`returned` 为本页条数。
+
+```bash
+curl -s 'localhost:8000/sessions/lab-1/source-gaps?max_gap_seconds=60&limit=50'
+```
+
+```json
+{
+  "session_id": "lab-1",
+  "source_id": null,
+  "from": null,
+  "to": null,
+  "max_gap_seconds": 60.0,
+  "limit": 50,
+  "matched": 1,
+  "returned": 1,
+  "has_more": false,
+  "next_cursor": null,
+  "gaps": [
+    {
+      "source_id": "thermometer-a",
+      "start_key": {"observed_at": "2026-09-21T10:00:10Z", "source_id": "thermometer-a", "seq": 2},
+      "end_key":   {"observed_at": "2026-09-21T10:01:20Z", "source_id": "thermometer-a", "seq": 3},
+      "gap_seconds": 70.0
+    }
+  ]
+}
+```
+
+- `open` 与 `closed` 会话均可扫描（关闭后针对尾流发布冻结的已发布流计算）。
+- 错误码：会话不存在 → 404；缺失/非法 `max_gap_seconds`（非正、NaN/Infinity、非数值）、
+  非法 `limit`、非法 `from`/`to`、`from` 晚于 `to`、空白或未声明的 `source_id`、
+  损坏游标 → 400。
+
 ## 数据库迁移
 
 建表采用“**幂等基础 schema + 版本化迁移**”：应用启动（FastAPI lifespan）时自动创建
@@ -768,6 +830,7 @@ curl -s -X POST localhost:8000/sessions/lab-1/quarantine-audit \
 │   ├── release_plan.py  # 释放计划：同一读快照内计算放出最早 N 条 buffered 读数的最小时钟推进
 │   ├── retention.py     # 检查点安全清理：dry_run 报告/单事务原子删除 cutoff 之前的已发布与隔离读数
 │   ├── quarantine_audit.py # 隔离影响预演：同一读快照内计算隔离读数插入已发布流的位置/邻居/检查点影响
+│   ├── source_gaps.py   # 来源缺口扫描：同一读快照内按来源找出已发布读数的相邻事件时间缺口（只读）
 │   ├── errors.py        # 400/404/409/422 业务异常
 │   ├── cursor.py        # 不透明 keyset 分页游标
 │   ├── database.py      # SQLite schema、版本化迁移、连接、BEGIN IMMEDIATE 事务
@@ -782,7 +845,8 @@ curl -s -X POST localhost:8000/sessions/lab-1/quarantine-audit \
 │   ├── test_checkpoints.py  # 检查点创建/幂等/409/继续读取分页/不可变/迁移测试（39 个）
 │   ├── test_release_plan.py # 释放计划目标水位线/逐来源推进/封存不可达/422/409/并发只读测试（19 个）
 │   ├── test_retention.py    # 检查点安全清理：dry_run/保护边界/原子删除/幂等/不改变既有语义测试（28 个）
-│   └── test_quarantine_audit.py # 隔离影响预演：插入位置/邻居时间差/检查点影响/过滤/400/只读测试（44 个）
+│   ├── test_quarantine_audit.py # 隔离影响预演：插入位置/邻居时间差/检查点影响/过滤/400/只读测试（44 个）
+│   └── test_source_gaps.py  # 来源缺口扫描：严格大于阈值/过滤/游标分页/400/只读测试（42 个）
 ├── Dockerfile
 ├── docker-compose.yml
 └── requirements.txt
